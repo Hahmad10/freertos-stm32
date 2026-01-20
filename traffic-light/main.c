@@ -56,6 +56,89 @@
 #define STOP_LINE_POS 7  /* Stop line at bit 7 (0-indexed from entry) */
 
 /*-----------------------------------------------------------*/
+/* Middleware: GPIO Initialization                      */
+/* Configures all pins on GPIOC used by the traffic system. */
+/*-----------------------------------------------------------*/
+
+static void GPIO_Init_TLS(void) {
+    GPIO_InitTypeDef GPIO_InitStruct;
+
+    /* Must enable the clock for GPIOC before configuring any pins on it */
+    RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_GPIOC, ENABLE);
+
+    /* Configure output pins:
+     * PC0, PC1, PC2 = traffic light LEDs (directly driven by GPIO)
+     * PC6, PC7, PC8 = shift register control lines (data, clock, reset)
+     * Push-pull output: pin drives both high and low (vs open-drain) */
+    GPIO_InitStruct.GPIO_Pin = TLS_RED_PIN | TLS_AMBER_PIN | TLS_GREEN_PIN |
+                               TLS_SR_DATA_PIN | TLS_SR_CLOCK_PIN | TLS_SR_RESET_PIN;
+    GPIO_InitStruct.GPIO_Mode = GPIO_Mode_OUT;     /* Digital output */
+    GPIO_InitStruct.GPIO_OType = GPIO_OType_PP;    /* Push-pull (can source and sink current) */
+    GPIO_InitStruct.GPIO_Speed = GPIO_Speed_50MHz; /* Switching speed */
+    GPIO_InitStruct.GPIO_PuPd = GPIO_PuPd_NOPULL;  /* No internal pull-up or pull-down */
+    GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+    /* Configure PC3 as analog input for potentiometer.
+     * Analog mode is required for the ADC to read a voltage level. */
+    GPIO_InitStruct.GPIO_Pin = TLS_POT_PIN;
+    GPIO_InitStruct.GPIO_Mode = GPIO_Mode_AN; /* Analog mode for ADC */
+    GPIO_InitStruct.GPIO_PuPd = GPIO_PuPd_NOPULL;
+    GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+    /* Shift register reset is active-low: HIGH = normal operation, LOW = clear all outputs.
+     * Start with reset HIGH so the registers operate normally. */
+    GPIO_SetBits(GPIOC, TLS_SR_RESET_PIN);
+    /* Clock idles HIGH; data is latched on the falling edge */
+    GPIO_SetBits(GPIOC, TLS_SR_CLOCK_PIN);
+}
+
+/*-----------------------------------------------------------*/
+/* Middleware: ADC Initialization & Read                */
+/* ADC1 Channel 13 reads the potentiometer voltage on PC3. */
+/* 12-bit resolution: returns 0 (0V) to 4095 (3.3V). */
+/*-----------------------------------------------------------*/
+
+static void ADC_Init_TLS(void) {
+    ADC_InitTypeDef ADC_InitStruct;
+    ADC_CommonInitTypeDef ADC_CommonInitStruct;
+
+    /* Enable the clock for ADC1 (on the APB2 bus) */
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_ADC1, ENABLE);
+
+    /* ADC Common configuration (shared settings across ADC peripherals) */
+    ADC_CommonInitStruct.ADC_Mode = ADC_Mode_Independent;                /* Only using ADC1, not dual/triple mode */
+    ADC_CommonInitStruct.ADC_Prescaler = ADC_Prescaler_Div4;             /* ADC clock = APB2/4 */
+    ADC_CommonInitStruct.ADC_DMAAccessMode = ADC_DMAAccessMode_Disabled; /* Not using DMA */
+    ADC_CommonInitStruct.ADC_TwoSamplingDelay = ADC_TwoSamplingDelay_5Cycles;
+    ADC_CommonInit(&ADC_CommonInitStruct);
+
+    /* ADC1 specific configuration */
+    ADC_InitStruct.ADC_Resolution = ADC_Resolution_12b;                      /* 12-bit: 0 to 4095 */
+    ADC_InitStruct.ADC_ScanConvMode = DISABLE;                               /* Single channel, not scanning multiple */
+    ADC_InitStruct.ADC_ContinuousConvMode = DISABLE;                         /* Software-triggered, one conversion at a time */
+    ADC_InitStruct.ADC_ExternalTrigConvEdge = ADC_ExternalTrigConvEdge_None; /* No external trigger */
+    ADC_InitStruct.ADC_DataAlign = ADC_DataAlign_Right;                      /* Result is right-aligned in the data register */
+    ADC_InitStruct.ADC_NbrOfConversion = 1;                                  /* One channel per conversion */
+    ADC_Init(ADC1, &ADC_InitStruct);
+
+    /* Map ADC1 to Channel 13 (which is the fixed channel for PC3 on STM32F4).
+     * 144-cycle sample time: longer = more accurate reading from the pot. */
+    ADC_RegularChannelConfig(ADC1, ADC_Channel_13, 1, ADC_SampleTime_144Cycles);
+
+    /* Turn on ADC1 */
+    ADC_Cmd(ADC1, ENABLE);
+}
+
+/* Read a single ADC value. Triggers a conversion, waits for it, returns the result.
+ * Blocking wait is fine here ADC conversions take microseconds. */
+static uint16_t ADC_Read(void) {
+    ADC_SoftwareStartConv(ADC1); /* Start a conversion */
+    while (ADC_GetFlagStatus(ADC1, ADC_FLAG_EOC) == RESET)
+        ;                                /* Wait for End Of Conversion flag */
+    return ADC_GetConversionValue(ADC1); /* Read and return the 12-bit result */
+}
+
+/*-----------------------------------------------------------*/
 /* FreeRTOS Hook Functions                             */
 /* These are required by FreeRTOS the project won't link */
 /* without them. They handle error conditions.         */
