@@ -139,6 +139,61 @@ static uint16_t ADC_Read(void) {
 }
 
 /*-----------------------------------------------------------*/
+/* Middleware: Shift Register Driver (SN74HC164N)       */
+/* 3 shift registers daisy-chained: 3 x 8 bits = 24 bits. */
+/* We use 19 of those for the green car LEDs.          */
+/* Data is clocked in LSB-first on the falling clock edge. */
+/*-----------------------------------------------------------*/
+
+/* Small busy-wait delay (~1 microsecond at 168MHz).
+ * The shift register needs brief pauses between signal changes. */
+static void SR_Delay(void) {
+    volatile uint32_t i;
+    for (i = 0; i < 50; i++)
+        ;
+}
+
+/* Clear all shift register outputs to 0 by pulsing reset LOW then HIGH. */
+static void ShiftRegister_Reset(void) {
+    GPIO_ResetBits(GPIOC, TLS_SR_RESET_PIN); /* Pull reset LOW clears all outputs */
+    SR_Delay();
+    GPIO_SetBits(GPIOC, TLS_SR_RESET_PIN); /* Pull reset HIGH normal operation resumes */
+    SR_Delay();
+}
+
+/* Write a 24-bit value to the shift register chain.
+ * Each bit controls one LED. Bit 0 = first LED (traffic entry).
+ *
+ * How it works:
+ * 1. Reset clears all outputs
+ * 2. For each of 24 bits (LSB first):
+ *    a. Set the data pin (PC6) to the bit value (high or low)
+ *    b. Create a falling edge on the clock (PC7): HIGH LOW HIGH
+ *    c. The falling edge shifts the data bit into the register
+ * 3. After 24 clock pulses, all bits are in place across all 3 registers */
+static void ShiftRegister_Write(uint32_t data) {
+    int i;
+    ShiftRegister_Reset(); /* Start fresh clear all outputs */
+
+    /* Clock out 24 bits, LSB first (bit 0 goes in first, ends up at far end of chain) */
+    for (i = 0; i <= 23; i++) {
+        /* Set data pin to current bit value */
+        if (data & (1 << i)) {
+            GPIO_SetBits(GPIOC, TLS_SR_DATA_PIN); /* Bit is 1: data HIGH */
+        } else {
+            GPIO_ResetBits(GPIOC, TLS_SR_DATA_PIN); /* Bit is 0: data LOW */
+        }
+        SR_Delay();
+
+        /* Create falling edge on clock to latch the data bit */
+        GPIO_ResetBits(GPIOC, TLS_SR_CLOCK_PIN); /* Clock LOW (falling edge data latched) */
+        SR_Delay();
+        GPIO_SetBits(GPIOC, TLS_SR_CLOCK_PIN); /* Clock back to HIGH (idle state) */
+        SR_Delay();
+    }
+}
+
+/*-----------------------------------------------------------*/
 /* FreeRTOS Hook Functions                             */
 /* These are required by FreeRTOS the project won't link */
 /* without them. They handle error conditions.         */
