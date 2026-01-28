@@ -56,6 +56,34 @@
 #define STOP_LINE_POS 7  /* Stop line at bit 7 (0-indexed from entry) */
 
 /*-----------------------------------------------------------*/
+/* Queue Handles                                       */
+/* These are the ONLY global state. All data flows through */
+/* queues, not shared variables. Queues are thread-safe. */
+/*-----------------------------------------------------------*/
+static xQueueHandle xFlowRateQueue = NULL;   /* Carries flow rate (0-100) from FlowTask to others */
+static xQueueHandle xLightStateQueue = NULL; /* Carries light state (0/1/2) from timer callbacks to DisplayTask */
+static xQueueHandle xNewCarQueue = NULL;     /* Carries car spawn events from GeneratorTask to DisplayTask */
+
+/* ---- Timer Handles ---- */
+static TimerHandle_t xGreenTimer = NULL;  /* One-shot: fires when green phase ends */
+static TimerHandle_t xYellowTimer = NULL; /* One-shot: fires when yellow phase ends */
+static TimerHandle_t xRedTimer = NULL;    /* One-shot: fires when red phase ends */
+
+/* ---- Task Forward Declarations ---- */
+static void TrafficFlowTask(void *pvParameters);
+static void TrafficLightTask(void *pvParameters);
+static void TrafficGeneratorTask(void *pvParameters);
+static void SystemDisplayTask(void *pvParameters);
+
+/* ---- Timer Callback Declarations ---- */
+static void vGreenTimerCallback(TimerHandle_t xTimer);
+static void vYellowTimerCallback(TimerHandle_t xTimer);
+static void vRedTimerCallback(TimerHandle_t xTimer);
+
+/* ---- Hardware Setup ---- */
+static void prvSetupHardware(void);
+
+/*-----------------------------------------------------------*/
 /* Middleware: GPIO Initialization                      */
 /* Configures all pins on GPIOC used by the traffic system. */
 /*-----------------------------------------------------------*/
@@ -190,6 +218,42 @@ static void ShiftRegister_Write(uint32_t data) {
         SR_Delay();
         GPIO_SetBits(GPIOC, TLS_SR_CLOCK_PIN); /* Clock back to HIGH (idle state) */
         SR_Delay();
+    }
+}
+
+/*-----------------------------------------------------------*/
+/* Task: Traffic Flow Adjustment (Priority 2)          */
+/* Reads the potentiometer via ADC every 100ms and publishes */
+/* the flow rate (0-100%) to the FlowRate queue.       */
+/* Other tasks peek this queue to get the current flow rate. */
+/*-----------------------------------------------------------*/
+
+static void TrafficFlowTask(void *pvParameters) {
+    TickType_t xLastWakeTime = xTaskGetTickCount(); /* Record start time for periodic execution */
+    uint16_t adc_value;
+    uint16_t flow_rate;
+
+    while (1) {
+        /* Read potentiometer. Divide by 10 to scale raw ADC into usable range. */
+        adc_value = ADC_Read() / 10;
+
+        /* Convert ADC value to 0-100% flow rate.
+         * Cast to uint32_t first to prevent overflow during multiplication:
+         * e.g. 3800 * 100 = 380,000 which exceeds uint16_t max of 65,535. */
+        flow_rate = (uint16_t)((uint32_t)adc_value * 100 / 3800);
+
+        /* Debug output to SWV ITM console (visible in TrueSTUDIO) */
+        printf("ADC: %u Flow: %u%%\n", (unsigned int)adc_value, (unsigned int)flow_rate);
+
+        /* Publish flow rate to queue. xQueueOverwrite always succeeds:
+         * it replaces whatever is in the length-1 queue with the new value.
+         * This way, readers always get the LATEST flow rate, not a stale one. */
+        xQueueOverwrite(xFlowRateQueue, &flow_rate);
+
+        /* Sleep until exactly 100ms after last wake. vTaskDelayUntil compensates
+         * for execution time so the period is consistent (vs vTaskDelay which
+         * would drift by adding execution time on top of the delay). */
+        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(FLOW_READ_PERIOD_MS));
     }
 }
 
