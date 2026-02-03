@@ -222,6 +222,70 @@ static void ShiftRegister_Write(uint32_t data) {
 }
 
 /*-----------------------------------------------------------*/
+/* Helper: Duration Calculations                       */
+/* Green and red durations scale linearly with flow rate. */
+/* At max flow: green=10s, red=5s (green is 2x red). */
+/* At min flow: green=5s, red=10s (red is 2x green). */
+/* Yellow is always constant at 2 seconds.             */
+/*-----------------------------------------------------------*/
+
+/* More traffic   longer green light to let more cars through.
+ * flow=0: 5000 + 0 = 5s. flow=100: 5000 + 5000 = 10s. */
+static uint32_t CalculateGreenDuration(uint16_t flow_rate) {
+    return GREEN_MIN_MS + ((GREEN_MAX_MS - GREEN_MIN_MS) * flow_rate) / 100;
+}
+
+/* More traffic   shorter red light so cars wait less.
+ * flow=0: 10000 - 0 = 10s. flow=100: 10000 - 5000 = 5s. */
+static uint32_t CalculateRedDuration(uint16_t flow_rate) {
+    return RED_MAX_MS - ((RED_MAX_MS - RED_MIN_MS) * flow_rate) / 100;
+}
+
+/*-----------------------------------------------------------*/
+/* Timer Callbacks Traffic Light State Machine            */
+/*                                                     */
+/* These form a chain: each callback changes the light state */
+/* and starts the next timer. The cycle repeats forever: */
+/* GREEN -> (timer fires) -> YELLOW -> (timer fires) -> RED */
+/*     -> (timer fires) -> GREEN -> ...                        */
+/*                                                     */
+/* Callbacks run in the FreeRTOS timer service task context, */
+/* not in any of our application tasks.                */
+/*-----------------------------------------------------------*/
+
+/* Called when the green phase expires. Switches to yellow and starts yellow timer. */
+static void vGreenTimerCallback(TimerHandle_t xTimer) {
+    uint8_t state = LIGHT_YELLOW;
+    xQueueOverwrite(xLightStateQueue, &state); /* Tell all tasks: light is now YELLOW */
+    xTimerStart(xYellowTimer, 0);              /* Start the 2-second yellow timer */
+}
+
+/* Called when yellow expires. Switches to red.
+ * Reads the current flow rate to calculate how long red should last. */
+static void vYellowTimerCallback(TimerHandle_t xTimer) {
+    uint16_t flow_rate = 50; /* Default 50% if queue is empty (safety net) */
+    uint8_t state = LIGHT_RED;
+    xQueueOverwrite(xLightStateQueue, &state); /* Tell all tasks: light is now RED */
+
+    /* Read current flow rate to decide red duration */
+    xQueuePeek(xFlowRateQueue, &flow_rate, 0); /* Peek: read without removing from queue */
+    /* xTimerChangePeriod both changes the period AND starts the timer */
+    xTimerChangePeriod(xRedTimer, pdMS_TO_TICKS(CalculateRedDuration(flow_rate)), 0);
+}
+
+/* Called when red expires. Switches to green.
+ * Reads the current flow rate to calculate how long green should last. */
+static void vRedTimerCallback(TimerHandle_t xTimer) {
+    uint16_t flow_rate = 50; /* Default 50% if queue is empty (safety net) */
+    uint8_t state = LIGHT_GREEN;
+    xQueueOverwrite(xLightStateQueue, &state); /* Tell all tasks: light is now GREEN */
+
+    /* Read current flow rate to decide green duration */
+    xQueuePeek(xFlowRateQueue, &flow_rate, 0);
+    xTimerChangePeriod(xGreenTimer, pdMS_TO_TICKS(CalculateGreenDuration(flow_rate)), 0);
+}
+
+/*-----------------------------------------------------------*/
 /* Task: Traffic Flow Adjustment (Priority 2)          */
 /* Reads the potentiometer via ADC every 100ms and publishes */
 /* the flow rate (0-100%) to the FlowRate queue.       */
@@ -254,6 +318,36 @@ static void TrafficFlowTask(void *pvParameters) {
          * for execution time so the period is consistent (vs vTaskDelay which
          * would drift by adding execution time on top of the delay). */
         vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(FLOW_READ_PERIOD_MS));
+    }
+}
+
+/*-----------------------------------------------------------*/
+/* Task: Traffic Light State Machine (Priority 3 highest) */
+/* Initializes the light to GREEN, starts the first timer, */
+/* then sleeps forever. All subsequent state transitions are */
+/* handled by the timer callbacks above.               */
+/*-----------------------------------------------------------*/
+
+static void TrafficLightTask(void *pvParameters) {
+    uint16_t flow_rate = 50; /* Default if flow queue not populated yet */
+    uint8_t initial_state = LIGHT_GREEN;
+
+    /* Set initial light state to GREEN */
+    xQueueOverwrite(xLightStateQueue, &initial_state);
+
+    /* Wait up to 500ms for FlowTask to put a value in the flow queue.
+     * This gives the flow task time to do its first ADC read. */
+    xQueuePeek(xFlowRateQueue, &flow_rate, pdMS_TO_TICKS(500));
+
+    /* Start the green timer. xTimerChangePeriod sets the duration based on
+     * current flow rate AND starts the timer. Once this fires, the callback
+     * chain (    greenyellowredgreen    ...) runs forever on its own. */
+    xTimerChangePeriod(xGreenTimer, pdMS_TO_TICKS(CalculateGreenDuration(flow_rate)), 0);
+
+    /* Nothing left to do. Sleep forever.
+     * FreeRTOS tasks must never return they must loop forever or delete themselves. */
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
