@@ -56,6 +56,23 @@
 #define STOP_LINE_POS 7  /* Stop line at bit 7 (0-indexed from entry) */
 
 /*-----------------------------------------------------------*/
+/* Simple PRNG (xorshift32)                            */
+/* Lightweight random number generator for embedded use. */
+/* XORs the state with bit-shifted versions of itself to */
+/* produce pseudo-random numbers. Seeded from ADC noise. */
+/*-----------------------------------------------------------*/
+static uint32_t prng_state = 1;
+
+static uint32_t prng_rand(void) {
+    uint32_t x = prng_state;
+    x ^= x << 13;   /* XOR with left-shifted self */
+    x ^= x >> 17;   /* XOR with right-shifted self */
+    x ^= x << 5;    /* XOR with left-shifted self again */
+    prng_state = x; /* Save for next call */
+    return x;       /* Returns a pseudo-random 32-bit number */
+}
+
+/*-----------------------------------------------------------*/
 /* Queue Handles                                       */
 /* These are the ONLY global state. All data flows through */
 /* queues, not shared variables. Queues are thread-safe. */
@@ -348,6 +365,46 @@ static void TrafficLightTask(void *pvParameters) {
      * FreeRTOS tasks must never return they must loop forever or delete themselves. */
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+/*-----------------------------------------------------------*/
+/* Task: Traffic Generator (Priority 2)                */
+/* Every 500ms (same rate as car movement), decides whether */
+/* to spawn a new car based on flow rate. Higher flow = */
+/* higher probability of spawning.                     */
+/*-----------------------------------------------------------*/
+
+static void TrafficGeneratorTask(void *pvParameters) {
+    TickType_t xLastWakeTime = xTaskGetTickCount(); /* For fixed-rate periodic execution */
+    uint16_t flow_rate = 0;                         /* Local copy of flow rate, updated each tick */
+    uint8_t new_car = 1;                            /* Value sent to queue just a flag meaning "car exists" */
+    uint32_t spawn_chance;                          /* Probability out of 100 that a car spawns this tick */
+
+    while (1) {
+        /* Read the latest flow rate. Peek = read without removing.
+         * Timeout 0 = don't block, just use last known value if queue is empty. */
+        xQueuePeek(xFlowRateQueue, &flow_rate, 0);
+
+        /* Calculate spawn probability based on flow rate.
+         * flow=0      spawn_chance = 17 + 0 = 17% (sparse: ~1 car per 6 ticks, ~6 LED gap)
+         * flow=50     spawn_chance = 17 + 16 = 33% (moderate traffic)
+         * flow=100    spawn_chance = 17 + 33 = 50% (dense traffic)
+         * 17 = base chance (always some traffic), 33 = range added by flow */
+        spawn_chance = 17 + (83 * flow_rate) / 100;
+
+        /* Roll a random number 0-99. If it's below spawn_chance, spawn a car.
+         * Example: spawn_chance=17 numbers 0-16 trigger a spawn 17% chance.
+         * prng_rand() returns a large random uint32_t, % 100 gives 0-99. */
+        if ((prng_rand() % 100) < spawn_chance) {
+            /* Send a car event to the NewCar queue. DisplayTask will receive it.
+             * Timeout 0 = if queue is full (10 items), just drop it, don't block. */
+            xQueueSend(xNewCarQueue, &new_car, 0);
+        }
+
+        /* Sleep until next 500ms tick. Same rate as DisplayTask so car spawning
+         * and car movement stay synchronized. */
+        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(CAR_MOVE_PERIOD_MS));
     }
 }
 
