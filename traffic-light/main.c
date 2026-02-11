@@ -259,6 +259,17 @@ static uint32_t CalculateRedDuration(uint16_t flow_rate) {
 }
 
 /*-----------------------------------------------------------*/
+/* Helper: Build Shift Register Output                 */
+/* Maps the 19-bit car_positions bitmask directly to the */
+/* shift register output. Bits 0-18 = LEDs 0-18. No gap. */
+/* Traffic lights are on GPIO, NOT in the shift register. */
+/*-----------------------------------------------------------*/
+
+static uint32_t BuildShiftRegisterOutput(uint32_t car_positions, uint8_t light_state) {
+    return car_positions & 0x7FFFF; /* Mask to 19 bits (0x7FFFF = 0b1111111111111111111) */
+}
+
+/*-----------------------------------------------------------*/
 /* Timer Callbacks Traffic Light State Machine            */
 /*                                                     */
 /* These form a chain: each callback changes the light state */
@@ -404,6 +415,120 @@ static void TrafficGeneratorTask(void *pvParameters) {
 
         /* Sleep until next 500ms tick. Same rate as DisplayTask so car spawning
          * and car movement stay synchronized. */
+        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(CAR_MOVE_PERIOD_MS));
+    }
+}
+
+/*-----------------------------------------------------------*/
+/* Task: System Display (Priority 1 lowest)              */
+/*                                                     */
+/* Every 500ms:                                        */
+/* 1. Reads the current traffic light state            */
+/* 2. Moves all cars forward by one position (bitmask) */
+/* 3. Adds a new car at the entry if one was spawned */
+/* 4. Writes the car positions to the shift registers */
+/* 5. Sets the traffic light GPIO pin                  */
+/*                                                     */
+/* Cars are stored as a uint32_t bitmask. Each bit = 1 LED: */
+/* Bit 0 = entry (leftmost LED on board)               */
+/* Bit 7 = stop line (where cars stop on red/yellow) */
+/* Bit 18 = exit (rightmost LED, cars disappear here) */
+/*-----------------------------------------------------------*/
+
+static void SystemDisplayTask(void *pvParameters) {
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    uint32_t car_positions = 0;        /* Bitmask: each 1-bit = a car at that LED position */
+    uint8_t light_state = LIGHT_GREEN; /* Local copy of current light color */
+    uint8_t new_car;                   /* Buffer for receiving from NewCar queue */
+    uint32_t sr_output;                /* What gets sent to the shift registers */
+    uint32_t new_positions;            /* Temporary bitmask built during car movement */
+    int pos;                           /* Current position being processed */
+    int next_pos;                      /* Position the car wants to move to */
+
+    while (1) {
+        /* --- STEP 1: Get current traffic light state --- */
+        /* Peek (read without removing) so other tasks can also read it */
+        xQueuePeek(xLightStateQueue, &light_state, 0);
+
+        /* --- STEP 2: Move existing cars --- */
+        /* Build a fresh bitmask (new_positions) by processing each car.
+         * Iterate RIGHT TO LEFT (pos 18 down to 0) so that cars further
+         * ahead are placed first, allowing us to check for collisions
+         * when processing cars behind them. */
+        new_positions = 0;
+        for (pos = ROAD_LENGTH - 1; pos >= 0; pos--) {
+            /* Skip this position if there's no car here */
+            if (!(car_positions & (1 << pos)))
+                continue;
+
+            next_pos = pos + 1; /* Where this car wants to move */
+
+            /* Car at the end of the road (bit 18)? It exits   just don't
+             * add it to new_positions, so it disappears. */
+            if (next_pos >= ROAD_LENGTH)
+                continue;
+
+            /* Car is at the STOP LINE and light is red or yellow?
+             * Stay put   don't move past the stop line. */
+            if (pos == STOP_LINE_POS && light_state != LIGHT_GREEN) {
+                new_positions |= (1 << pos); /* Keep car at same position */
+                continue;
+            }
+
+            /* Car is PAST the stop line (already in or through the intersection).
+             * These cars keep moving regardless of light color, but must still
+             * check for collision (next position occupied). */
+            if (pos > STOP_LINE_POS) {
+                if (new_positions & (1 << next_pos)) {
+                    new_positions |= (1 << pos); /* Blocked by car ahead stay */
+                } else {
+                    new_positions |= (1 << next_pos); /* Free move forward */
+                }
+                continue;
+            }
+
+            /* Car is BEFORE the stop line. Check if next position is occupied
+             * (causes pile-up / bumper-to-bumper behind a stopped car). */
+            if (new_positions & (1 << next_pos)) {
+                new_positions |= (1 << pos); /* Blocked stay (pile up) */
+                continue;
+            }
+
+            /* Nothing blocking move forward one position */
+            new_positions |= (1 << next_pos);
+        }
+        car_positions = new_positions; /* Replace old positions with new */
+
+        /* --- STEP 3: Add new car at the entry (bit 0) --- */
+        /* Drain the NewCar queue. xQueueReceive removes items (vs Peek).
+         * Only actually place one car per tick, and only if bit 0 is empty. */
+        while (xQueueReceive(xNewCarQueue, &new_car, 0) == pdTRUE) {
+            if (!(car_positions & 0x01)) { /* Is position 0 (entry) empty? */
+                car_positions |= 0x01;     /* Place a car at the entry */
+                break;                     /* One car per tick max */
+            }
+        }
+
+        /* Safety: mask to 19 bits to discard any bits beyond the road length */
+        car_positions &= ((1 << ROAD_LENGTH) - 1);
+
+        /* --- STEP 4: Write car positions to shift registers --- */
+        printf("cars:%u light:%u\n", (unsigned int)car_positions, (unsigned int)light_state);
+        sr_output = BuildShiftRegisterOutput(car_positions, light_state);
+        ShiftRegister_Write(sr_output); /* Clocks 24 bits out to the 3 daisy-chained SRs */
+
+        /* --- STEP 5: Set traffic light GPIO pins --- */
+        /* Turn all three LEDs off first, then turn on the correct one.
+         * Traffic lights are driven directly by GPIO, NOT through the shift register. */
+        GPIO_ResetBits(GPIOC, TLS_RED_PIN | TLS_AMBER_PIN | TLS_GREEN_PIN);
+        if (light_state == LIGHT_GREEN)
+            GPIO_SetBits(GPIOC, TLS_GREEN_PIN);
+        if (light_state == LIGHT_YELLOW)
+            GPIO_SetBits(GPIOC, TLS_AMBER_PIN);
+        if (light_state == LIGHT_RED)
+            GPIO_SetBits(GPIOC, TLS_RED_PIN);
+
+        /* Sleep until next 500ms tick */
         vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(CAR_MOVE_PERIOD_MS));
     }
 }
