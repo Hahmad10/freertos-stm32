@@ -534,6 +534,74 @@ static void SystemDisplayTask(void *pvParameters) {
 }
 
 /*-----------------------------------------------------------*/
+/* main() - System Entry Point                        */
+/*                                                     */
+/* Execution order:                                    */
+/* 1. Initialize hardware (GPIO, ADC)                  */
+/* 2. Seed the random number generator                 */
+/* 3. Create 3 queues for inter-task communication     */
+/* 4. Create 3 one-shot timers for light phase transitions */
+/* 5. Create 4 tasks with assigned priorities          */
+/* 6. Start the FreeRTOS scheduler (never returns)     */
+/*-----------------------------------------------------------*/
+
+int main(void) {
+    /* Initialize hardware peripherals */
+    prvSetupHardware(); /* Set interrupt priority grouping */
+    GPIO_Init_TLS();    /* Configure GPIO pins for traffic lights, shift register, pot */
+    ADC_Init_TLS();     /* Configure ADC for potentiometer reading */
+
+    /* Seed PRNG with ADC noise for randomness. The | 1 ensures the seed
+     * is never zero (xorshift produces only zeros if seeded with zero). */
+    prng_state = ADC_Read() | 1;
+
+    /* Create 3 queues. All inter-task data flows through these.
+     * xQueueCreate(length, item_size) allocates from FreeRTOS heap. */
+    xFlowRateQueue = xQueueCreate(FLOW_QUEUE_LENGTH, sizeof(uint16_t));   /* 1 item, 2 bytes */
+    xLightStateQueue = xQueueCreate(LIGHT_QUEUE_LENGTH, sizeof(uint8_t)); /* 1 item, 1 byte */
+    xNewCarQueue = xQueueCreate(CAR_QUEUE_LENGTH, sizeof(uint8_t));       /* 10 items, 1 byte each */
+
+    /* Register queues with names so they appear in TrueSTUDIO's FreeRTOS
+     * debug view when you pause the debugger. Requires configUSE_TRACE_FACILITY=1. */
+    vQueueAddToRegistry(xFlowRateQueue, "FlowRate");
+    vQueueAddToRegistry(xLightStateQueue, "LightState");
+    vQueueAddToRegistry(xNewCarQueue, "NewCar");
+
+    /* Create 3 one-shot software timers (pdFALSE = one-shot, not auto-reload).
+     * One-shot means the timer fires once and stops. Each callback manually
+     * starts the next timer to create the GREEN -> YELLOW -> RED -> GREEN chain.
+     * xTimerCreate(name, initial_period, auto_reload, id, callback) */
+    xGreenTimer = xTimerCreate("GreenT", pdMS_TO_TICKS(GREEN_MAX_MS),
+                               pdFALSE, NULL, vGreenTimerCallback);
+    xYellowTimer = xTimerCreate("YellowT", pdMS_TO_TICKS(YELLOW_DURATION_MS),
+                                pdFALSE, NULL, vYellowTimerCallback);
+    xRedTimer = xTimerCreate("RedT", pdMS_TO_TICKS(RED_MAX_MS),
+                             pdFALSE, NULL, vRedTimerCallback);
+
+    /* Create 4 tasks. Higher priority number = higher priority.
+     * xTaskCreate(function, name, stack_size, params, priority, handle)
+     *
+     * Priority 3: TrafficLightTask must respond quickly for accurate transitions
+     * Priority 2: TrafficFlowTask, TrafficGeneratorTask medium importance
+     * Priority 1: SystemDisplayTask lowest, just renders what others decide
+     *
+     * All higher-priority tasks spend most time blocked in vTaskDelay, so
+     * the display task gets plenty of CPU time in the gaps. */
+    xTaskCreate(TrafficFlowTask, "FlowAdj", configMINIMAL_STACK_SIZE, NULL, 2, NULL);
+    xTaskCreate(TrafficLightTask, "TrLight", configMINIMAL_STACK_SIZE, NULL, 3, NULL);
+    xTaskCreate(TrafficGeneratorTask, "CarGen", configMINIMAL_STACK_SIZE, NULL, 2, NULL);
+    xTaskCreate(SystemDisplayTask, "Display", configMINIMAL_STACK_SIZE * 2, NULL, 1, NULL);
+
+    /* Start the FreeRTOS scheduler. This hands control to FreeRTOS and NEVER returns.
+     * From this point, the scheduler decides which task runs based on priority. */
+    vTaskStartScheduler();
+
+    /* Should never reach here. If it does, the scheduler failed to start
+     * (usually means not enough heap memory). */
+    return 0;
+}
+
+/*-----------------------------------------------------------*/
 /* FreeRTOS Hook Functions                             */
 /* These are required by FreeRTOS the project won't link */
 /* without them. They handle error conditions.         */
