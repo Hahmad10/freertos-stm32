@@ -142,6 +142,85 @@ void referenceTimerCallback(TimerHandle_t xTimer);
 
 
 //==================================================================
+// INSERT TASK - add a new task to the active list in deadline order
+//
+// Walks the list to find where the new task belongs (earlier deadline = closer to head).
+// Also creates the actual FreeRTOS task at priority 0 (paused).
+// updateScheduler() will set the head to priority 1 after this returns.
+//==================================================================
+BaseType_t insertTask(ddTaskNode_t **activeList, ddTask_t newTask) {
+    if (*activeList == NULL) {
+        // List is empty - new task becomes the head
+        *activeList = (ddTaskNode_t *)pvPortMalloc(sizeof(ddTaskNode_t));
+        (*activeList)->task = newTask;
+        (*activeList)->next = NULL;
+        // Create FreeRTOS task at priority 0 -- intentionally paused.
+        // We don't want it running yet; DDS must finish scheduling first.
+        // updateScheduler() will promote the head to priority 1 after this returns.
+        xTaskCreate(newTask.taskFunc, newTask.taskID, configMINIMAL_STACK_SIZE,
+                    NULL, 0, &((*activeList)->task.taskHandle));
+    } else {
+        // Walk the list to find the right position (sorted by deadline, earliest first).
+        // The >= means same-deadline tasks keep insertion order (FIFO tiebreaker).
+        // This matters in TB3 where all deadlines are equal -- T1 runs first because
+        // the generator releases it first.
+        ddTaskNode_t *currentNode = *activeList;
+        ddTaskNode_t *previousNode = NULL;
+        while (currentNode != NULL && newTask.absDeadline >= currentNode->task.absDeadline) {
+            previousNode = currentNode;
+            currentNode = currentNode->next;
+        }
+        // pvPortMalloc = FreeRTOS's malloc (deterministic timing, managed heap)
+        ddTaskNode_t *newNode = (ddTaskNode_t *)pvPortMalloc(sizeof(ddTaskNode_t));
+        newNode->task = newTask;
+        newNode->next = currentNode;
+        xTaskCreate(newTask.taskFunc, newTask.taskID, configMINIMAL_STACK_SIZE,
+                    NULL, 0, &newNode->task.taskHandle);
+        // Link it in
+        if (previousNode != NULL)
+            previousNode->next = newNode; // insert in middle or end
+        else
+            *activeList = newNode; // new earliest deadline = new head
+    }
+    return pdTRUE;
+}
+
+//==================================================================
+// REMOVE TASK - take the HEAD off the active list
+//
+// WHY always head? In EDF, the running task = earliest deadline = head
+// of the sorted list. On completion or overdue, it's always the head.
+//
+// The removed node gets prepended (O(1)) to whichever "retired" list
+// you pass in. Node is NOT freed here -- stays for monitor to count.
+// Freed later by DDS when heap runs low.
+//==================================================================
+BaseType_t removeTask(ddTaskNode_t **activeList, ddTaskNode_t **retiredList) {
+    if (*activeList == NULL)
+        return pdFALSE;
+
+    ddTaskNode_t *currentNode = *activeList;
+    *activeList = (*activeList)->next; // advance the list
+
+    currentNode->task.completionTime = getCurrentTime();
+
+    // This printf gives the release/completion timeline used to check EDF ordering
+    printf("Task ID: %s, Release: %d, Complete: %d\n",
+           currentNode->task.taskID,
+           currentNode->task.releaseTime,
+           currentNode->task.completionTime);
+
+    // Kill the FreeRTOS task (it's sitting in for(;;) after completeTask, waiting for this)
+    if (currentNode->task.taskHandle != NULL)
+        vTaskDelete(currentNode->task.taskHandle);
+
+    // Prepend to retired list (O(1) -- order doesn't matter for record-keeping)
+    currentNode->next = *retiredList;
+    *retiredList = currentNode;
+    return pdTRUE;
+}
+
+//==================================================================
 // UTILITY FUNCTIONS
 //==================================================================
 
