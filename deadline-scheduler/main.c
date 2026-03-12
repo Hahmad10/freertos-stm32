@@ -142,6 +142,103 @@ void referenceTimerCallback(TimerHandle_t xTimer);
 
 
 //==================================================================
+// DDS TASK - the brain of the scheduler (HIGHEST PRIORITY = 3)
+//
+// WHY highest priority? Must preempt ANY user task instantly when an
+// event arrives -- otherwise scheduling decisions would be delayed and
+// tasks could miss deadlines while waiting for DDS to respond.
+//
+// Sits in a loop waiting for messages. When one arrives:
+// RELEASE -> add new task to active list (sorted by deadline)
+// COMPLETE -> move head task to completed list
+// OVERDUE -> move head task to overdue list (deadline missed)
+// GET_*     -> send requested list back through response queue
+//
+// Before any scheduling change: pause the running task (priority 0)
+// After any scheduling change: promote new head (priority 1) + arm deadline timer
+//==================================================================
+void deadlineSchedulerTask(void *pvParameters) {
+    ddTaskNode_t *activeList = NULL;   // tasks waiting to run (sorted by deadline)
+    ddTaskNode_t *overdueList = NULL;  // tasks that missed their deadline
+    ddTaskNode_t *completeList = NULL; // tasks that finished on time
+
+    for (;;) {
+        DDSMessage_t ddsMessage;
+
+        // Block here until someone sends us a message
+        if (!xQueueReceive(ddsEventQueue, &ddsMessage, portMAX_DELAY))
+            continue;
+
+        EventType eventType = ddsMessage.reqType;
+
+        // enum values 0-2 = scheduling events, 3+ = queries.
+        // Queries just return data; scheduling events need pause+update cycle.
+        if (eventType >= GET_LISTS) {
+            switch (eventType) {
+                case GET_LISTS:
+                    xQueueSend(ddsResponseQueue, &activeList, 0);
+                    xQueueSend(ddsResponseQueue, &completeList, 0);
+                    xQueueSend(ddsResponseQueue, &overdueList, 0);
+                    break;
+                case GET_ACTIVE:
+                    xQueueSend(ddsResponseQueue, &activeList, 0);
+                    break;
+                case GET_COMPLETE:
+                    xQueueSend(ddsResponseQueue, &completeList, 0);
+                    break;
+                case GET_OVERDUE:
+                    xQueueSend(ddsResponseQueue, &overdueList, 0);
+                    break;
+                default:
+                    break;
+            }
+        } else {
+            // SCHEDULING EVENT: "freeze" the running task first (drop to priority 0)
+            // so it can't interfere while we rearrange the active list.
+            pauseScheduler(&activeList);
+
+            switch (eventType) {
+                case RELEASE_EVENT:
+                    // New task arrived - insert it in the right spot (sorted by deadline)
+                    insertTask(&activeList, ddsMessage.task);
+                    break;
+
+                case COMPLETE_EVENT:
+                    // Running task finished - move from active to completed
+                    removeTask(&activeList, &completeList);
+                    break;
+
+                case OVERDUE_EVENT:
+                    // Deadline timer fired - if head task is actually past deadline, move to overdue
+                    if (activeList && activeList->task.absDeadline < getCurrentTime())
+                        removeTask(&activeList, &overdueList);
+                    break;
+
+                default:
+                    break;
+            }
+
+            // Now promote the new head task and re-arm the deadline timer
+            updateScheduler(&activeList);
+        }
+
+        // MEMORY MANAGEMENT: each ddTaskNode_t is ~52 bytes. Completed nodes stay
+        // in completeList so the monitor can count them. We defer freeing until heap
+        // pressure because the monitor needs the data. 5000 = enough buffer to still
+        // allocate new tasks + stacks while cleanup runs.
+        if (xPortGetFreeHeapSize() < 5000) {
+            printf("Memory Full\n");
+            ddTaskNode_t *freedNode;
+            while (completeList != NULL) {
+                freedNode = completeList;
+                completeList = completeList->next;
+                vPortFree(freedNode);
+            }
+        }
+    }
+}
+
+//==================================================================
 // INSERT TASK - add a new task to the active list in deadline order
 //
 // Walks the list to find where the new task belongs (earlier deadline = closer to head).
@@ -218,6 +315,50 @@ BaseType_t removeTask(ddTaskNode_t **activeList, ddTaskNode_t **retiredList) {
     currentNode->next = *retiredList;
     *retiredList = currentNode;
     return pdTRUE;
+}
+
+//==================================================================
+// PAUSE SCHEDULER - set the running task's priority to 0
+// Called before any scheduling change so the running task doesn't
+// interfere while we rearrange the list.
+//==================================================================
+BaseType_t pauseScheduler(ddTaskNode_t **activeList) {
+    if (*activeList != NULL) {
+        vTaskPrioritySet((*activeList)->task.taskHandle, PAUSE_PRIO);
+        return pdTRUE;
+    }
+    return pdFALSE;
+}
+
+//==================================================================
+// UPDATE SCHEDULER - promote the head task and arm the deadline timer
+//
+// Sets head of active list to RUN_PRIO (1) so FreeRTOS runs it.
+// Arms the deadline timer to fire when this task's deadline arrives.
+// If the deadline already passed, fire immediately (period = 1 tick).
+//==================================================================
+BaseType_t updateScheduler(ddTaskNode_t **activeList) {
+    if (*activeList != NULL) {
+        // >>> THIS is the line that makes tasks actually RUN <<<
+        // Setting priority to 1 lets FreeRTOS schedule it when DDS yields.
+        vTaskPrioritySet((*activeList)->task.taskHandle, RUN_PRIO);
+
+        // Re-arm deadline timer for the NEW head task's deadline.
+        // xTimerChangePeriod sets the duration, xTimerReset starts it from zero.
+        uint32_t now = getCurrentTime();
+        if ((*activeList)->task.absDeadline <= now) {
+            xTimerChangePeriod(deadlineCheckTimer, 1, 0); // already late, fire now -> OVERDUE
+        } else {
+            xTimerChangePeriod(deadlineCheckTimer,
+                               pdMS_TO_TICKS((*activeList)->task.absDeadline - now), 0);
+        }
+        xTimerReset(deadlineCheckTimer, 0);
+        return pdTRUE;
+    } else {
+        // No tasks left - stop the deadline timer
+        xTimerStop(deadlineCheckTimer, 0);
+        return pdFALSE;
+    }
 }
 
 //==================================================================
