@@ -362,6 +362,60 @@ BaseType_t updateScheduler(ddTaskNode_t **activeList) {
 }
 
 //==================================================================
+// DDS INTERFACE FUNCTIONS
+// These are called by other tasks to communicate with the DDS.
+// They just package a message and send it through the queue.
+//==================================================================
+
+// Tell DDS a new task needs to be scheduled
+BaseType_t releaseTask(ddTask_t task) {
+    DDSMessage_t msg = {RELEASE_EVENT, task};
+    return xQueueSend(ddsEventQueue, &msg, portMAX_DELAY);
+}
+
+// Tell DDS the running task just finished
+BaseType_t completeTask(void) {
+    DDSMessage_t msg = {COMPLETE_EVENT, {0}};
+    return xQueueSend(ddsEventQueue, &msg, portMAX_DELAY);
+}
+
+// Request-response pattern: send GET_* to DDS, block until DDS responds with pointer.
+// xQueueReset clears stale data from a previous interrupted request.
+void getActiveList(ddTaskNode_t **active) {
+    if (uxQueueSpacesAvailable(ddsResponseQueue) < QUEUE_LEN)
+        xQueueReset(ddsResponseQueue);
+    DDSMessage_t req = {GET_ACTIVE, {0}};
+    xQueueSend(ddsEventQueue, &req, portMAX_DELAY);
+    xQueueReceive(ddsResponseQueue, active, portMAX_DELAY);
+}
+
+void getCompleteList(ddTaskNode_t **complete) {
+    if (uxQueueSpacesAvailable(ddsResponseQueue) < QUEUE_LEN)
+        xQueueReset(ddsResponseQueue);
+    DDSMessage_t req = {GET_COMPLETE, {0}};
+    xQueueSend(ddsEventQueue, &req, portMAX_DELAY);
+    xQueueReceive(ddsResponseQueue, complete, portMAX_DELAY);
+}
+
+void getOverdueList(ddTaskNode_t **overdue) {
+    if (uxQueueSpacesAvailable(ddsResponseQueue) < QUEUE_LEN)
+        xQueueReset(ddsResponseQueue);
+    DDSMessage_t req = {GET_OVERDUE, {0}};
+    xQueueSend(ddsEventQueue, &req, portMAX_DELAY);
+    xQueueReceive(ddsResponseQueue, overdue, portMAX_DELAY);
+}
+
+void getTaskLists(ddTaskNode_t **active, ddTaskNode_t **overdue, ddTaskNode_t **complete) {
+    if (uxQueueSpacesAvailable(ddsResponseQueue) < QUEUE_LEN)
+        xQueueReset(ddsResponseQueue);
+    DDSMessage_t req = {GET_LISTS, {0}};
+    xQueueSend(ddsEventQueue, &req, portMAX_DELAY);
+    xQueueReceive(ddsResponseQueue, active, portMAX_DELAY);
+    xQueueReceive(ddsResponseQueue, overdue, portMAX_DELAY);
+    xQueueReceive(ddsResponseQueue, complete, portMAX_DELAY);
+}
+
+//==================================================================
 // UTILITY FUNCTIONS
 //==================================================================
 
