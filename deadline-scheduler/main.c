@@ -52,6 +52,41 @@
 #define MONITOR_INTERVAL 100 // monitor prints every 100ms
 
 //------------------------------------------------------------------
+// TEST BENCH PARAMETERS
+//
+// Bench 1: Utilization = 95/500 + 150/500 + 250/750 = 0.82 (schedulable)
+// Bench 2: U = 95/250 + 150/500 + 250/750 = 1.01 (overloaded)
+// Bench 3: U = 100/500 + 200/500 + 200/500 = 1.00 (borderline)
+//------------------------------------------------------------------
+
+// ---- Test Bench 1 ----
+//#define TASK_GEN_INTERVAL 250
+//#define TASK1_EXEC       95
+//#define TASK1_PERIOD     500
+//#define TASK2_EXEC       150
+//#define TASK2_PERIOD     500
+//#define TASK3_EXEC       250
+//#define TASK3_PERIOD     750
+
+//// ---- Test Bench 2 ----
+//#define TASK_GEN_INTERVAL 250
+//#define TASK1_EXEC        95
+//#define TASK1_PERIOD      250
+//#define TASK2_EXEC        150
+//#define TASK2_PERIOD      500
+//#define TASK3_EXEC        250
+//#define TASK3_PERIOD      750
+
+//// ---- Test Bench 3 ----
+#define TASK_GEN_INTERVAL 500
+#define TASK1_EXEC        100
+#define TASK1_PERIOD      500
+#define TASK2_EXEC        200
+#define TASK2_PERIOD      500
+#define TASK3_EXEC        200
+#define TASK3_PERIOD      500
+
+//------------------------------------------------------------------
 // DATA STRUCTURES
 //------------------------------------------------------------------
 
@@ -413,6 +448,36 @@ void getTaskLists(ddTaskNode_t **active, ddTaskNode_t **overdue, ddTaskNode_t **
     xQueueReceive(ddsResponseQueue, active, portMAX_DELAY);
     xQueueReceive(ddsResponseQueue, overdue, portMAX_DELAY);
     xQueueReceive(ddsResponseQueue, complete, portMAX_DELAY);
+}
+
+//==================================================================
+// USER TASKS - simulate real work by busy-waiting
+//
+// delayMS = busy-wait (keeps CPU occupied, simulates real computation).
+// NOT vTaskDelay -- that would yield the CPU and not model real workload.
+// completeTask = sends COMPLETE_EVENT to DDS.
+// for(;;) = can't return from a FreeRTOS task (would crash). Spins at
+// low priority until DDS processes the completion and calls vTaskDelete.
+//==================================================================
+void userTask1(void *pvParameters) {
+    delayMS(TASK1_EXEC);
+    completeTask();
+    for (;;)
+        ; // DDS will delete this task
+}
+
+void userTask2(void *pvParameters) {
+    delayMS(TASK2_EXEC);
+    completeTask();
+    for (;;)
+        ;
+}
+
+void userTask3(void *pvParameters) {
+    delayMS(TASK3_EXEC);
+    completeTask();
+    for (;;)
+        ;
 }
 
 //==================================================================
