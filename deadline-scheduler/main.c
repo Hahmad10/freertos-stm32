@@ -397,6 +397,47 @@ BaseType_t updateScheduler(ddTaskNode_t **activeList) {
 }
 
 //==================================================================
+// TASK GENERATOR - creates new tasks at the right times
+//
+// Wakes up every TASK_GEN_INTERVAL ms (via semaphore from timer).
+// Checks each task: if enough time has passed (elapsed % period == 0),
+// it's time to release a new instance of that task.
+// Builds a ddTask_t struct and sends it to the DDS via releaseTask().
+//==================================================================
+void taskGeneratorTask(void *pvParameters) {
+    // Elapsed counters track the IDEAL schedule (not real time).
+    // Using modulo on clean counters avoids drift from real-time checks.
+    uint32_t task1Elapsed = 0, task2Elapsed = 0, task3Elapsed = 0;
+    uint32_t delta = TASK_GEN_INTERVAL;   // each invocation = one interval passed
+    xSemaphoreGive(taskReleaseSemaphore); // self-trigger so tasks release at t=0
+
+    for (;;) {
+        if (xSemaphoreTake(taskReleaseSemaphore, portMAX_DELAY) == pdTRUE) {
+            uint32_t now = getCurrentTime();
+
+            // Check each task: is it time to release a new instance?
+            // Deadline = elapsed + period (NOT now + period) -- aligns with theoretical schedule.
+            if ((task1Elapsed % TASK1_PERIOD) == 0) {
+                ddTask_t t = {NULL, userTask1, PERIODIC, "T1", 1, now, task1Elapsed + TASK1_PERIOD, 0};
+                releaseTask(t);
+            }
+            if ((task2Elapsed % TASK2_PERIOD) == 0) {
+                ddTask_t t = {NULL, userTask2, PERIODIC, "T2", 2, now, task2Elapsed + TASK2_PERIOD, 0};
+                releaseTask(t);
+            }
+            if ((task3Elapsed % TASK3_PERIOD) == 0) {
+                ddTask_t t = {NULL, userTask3, PERIODIC, "T3", 3, now, task3Elapsed + TASK3_PERIOD, 0};
+                releaseTask(t);
+            }
+
+            task1Elapsed += delta;
+            task2Elapsed += delta;
+            task3Elapsed += delta;
+        }
+    }
+}
+
+//==================================================================
 // DDS INTERFACE FUNCTIONS
 // These are called by other tasks to communicate with the DDS.
 // They just package a message and send it through the queue.
@@ -478,6 +519,44 @@ void userTask3(void *pvParameters) {
     completeTask();
     for (;;)
         ;
+}
+
+//==================================================================
+// TIMER CALLBACKS
+//==================================================================
+
+// Deadline timer fired = task may have missed its deadline.
+// "ToFront" = overdue events jump ahead of pending releases (they're urgent).
+// "FromISR" = timer callbacks run in ISR-like context; blocking calls are illegal.
+void deadlineTimerCallback(TimerHandle_t xTimer) {
+    DDSMessage_t msg = {OVERDUE_EVENT, {0}};
+    BaseType_t woken = pdFALSE;
+    xQueueSendToFrontFromISR(ddsEventQueue, &msg, &woken);
+    // If DDS (higher priority) woke up, yield to it immediately
+    if (woken)
+        taskYIELD();
+}
+
+// System clock: time stored in the timer's ID field (no global variable needed).
+// pvTimerGetTimerID reads it, vTimerSetTimerID writes it.
+void systemTimerCallback(TimerHandle_t xTimer) {
+    uint32_t t = (uint32_t)pvTimerGetTimerID(xTimer);
+    vTimerSetTimerID(xTimer, (void *)(t + 1));
+}
+
+// Shared callback -- both timers just give a semaphore, no need for separate callbacks.
+// TimerID 2 = generator timer, TimerID 3 = monitor timer.
+// xSemaphoreGiveFromISR = ISR-safe (non-blocking). taskYIELD = if the woken task has
+// higher priority than whatever was running, switch to it now (don't wait for next tick).
+void referenceTimerCallback(TimerHandle_t xTimer) {
+    BaseType_t woken = pdFALSE;
+    uint32_t id = (uint32_t)pvTimerGetTimerID(xTimer);
+    if (id == 2)
+        xSemaphoreGiveFromISR(taskReleaseSemaphore, &woken);
+    else
+        xSemaphoreGiveFromISR(monitorUpdateSemaphore, &woken);
+    if (woken)
+        taskYIELD();
 }
 
 //==================================================================
