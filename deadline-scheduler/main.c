@@ -438,6 +438,40 @@ void taskGeneratorTask(void *pvParameters) {
 }
 
 //==================================================================
+// MONITOR TASK - prints system status periodically
+//
+// Wakes up every MONITOR_INTERVAL ms (via semaphore from timer).
+// Asks DDS for the 3 lists, counts how many tasks are in each,
+// and prints the result.
+//==================================================================
+void monitorTask(void *pvParameters) {
+    ddTaskNode_t *taskLists[3] = {NULL, NULL, NULL};
+    int taskCounts[3] = {0, 0, 0};
+
+    for (;;) {
+        if (xSemaphoreTake(monitorUpdateSemaphore, portMAX_DELAY) == pdTRUE) {
+            // Ask DDS for each list
+            getActiveList(&taskLists[0]);
+            getCompleteList(&taskLists[1]);
+            getOverdueList(&taskLists[2]);
+
+            // Count nodes in each list
+            for (int i = 0; i < 3; i++) {
+                taskCounts[i] = 0;
+                ddTaskNode_t *node = taskLists[i];
+                while (node != NULL) {
+                    taskCounts[i]++;
+                    node = node->next;
+                }
+            }
+
+            printf("Time = %u | Active = %d | Complete = %d | Overdue = %d\n\n",
+                   (unsigned int)getCurrentTime(), taskCounts[0], taskCounts[1], taskCounts[2]);
+        }
+    }
+}
+
+//==================================================================
 // DDS INTERFACE FUNCTIONS
 // These are called by other tasks to communicate with the DDS.
 // They just package a message and send it through the queue.
