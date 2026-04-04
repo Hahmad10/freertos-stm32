@@ -175,6 +175,60 @@ void deadlineTimerCallback(TimerHandle_t xTimer);
 void systemTimerCallback(TimerHandle_t xTimer);
 void referenceTimerCallback(TimerHandle_t xTimer);
 
+//==================================================================
+// MAIN
+//==================================================================
+int main(void) {
+    setupHardware();
+
+    // Two queues (request-response pattern):
+    // ddsEventQueue: everyone -> DDS (release/complete/overdue/get requests)
+    // ddsResponseQueue: DDS -> monitor (list pointers sent back)
+    ddsEventQueue = xQueueCreate(QUEUE_LEN, sizeof(DDSMessage_t));
+    ddsResponseQueue = xQueueCreate(QUEUE_LEN, sizeof(ddTaskNode_t **));
+
+    // Create the 3 main tasks
+    // DDS gets 5000 words (20KB) stack -- large because printf uses 1-2KB alone.
+    // Tradeoff: bigger stack = less heap for dynamic task nodes. Try lowering to test.
+    xTaskCreate(deadlineSchedulerTask, "DDS", 3000, NULL, DDS_PRIO, NULL);
+    xTaskCreate(monitorTask, "MONITOR", configMINIMAL_STACK_SIZE, NULL, AUX_PRIO, NULL);
+    xTaskCreate(taskGeneratorTask, "GEN", configMINIMAL_STACK_SIZE, NULL, AUX_PRIO, NULL);
+
+    // Binary semaphores: start EMPTY (can't be taken until a timer gives them).
+    // This is "deferred interrupt processing" -- timer callback (ISR context) can't
+    // do complex work, so it just gives the semaphore to wake the real task.
+    taskReleaseSemaphore = xSemaphoreCreateBinary();
+    monitorUpdateSemaphore = xSemaphoreCreateBinary();
+
+    // System clock: ticks every 1ms. Time is stored IN the timer's ID field
+    // (pvTimerGetTimerID/vTimerSetTimerID) -- no global variable needed.
+    systemClockTimer = xTimerCreate("SysTimer", 1 / portTICK_PERIOD_MS, pdTRUE, (void *)0, systemTimerCallback);
+    xTimerStart(systemClockTimer, 0);
+
+    // Deadline timer: pdFALSE = one-shot (not auto-reload).
+    // updateScheduler() dynamically re-arms it for each new head task's deadline.
+    // 10000 is just a placeholder period -- gets overwritten immediately on first use.
+    deadlineCheckTimer = xTimerCreate("DeadlineTimer", 10000 / portTICK_PERIOD_MS, pdFALSE, (void *)1, deadlineTimerCallback);
+    xTimerStop(deadlineCheckTimer, 0);
+
+    // Generator timer: fires every TASK_GEN_INTERVAL ms to check if new tasks need releasing
+    taskGenerationTimer = xTimerCreate("GenTimer", pdMS_TO_TICKS(TASK_GEN_INTERVAL), pdTRUE, (void *)2, referenceTimerCallback);
+    xTimerStart(taskGenerationTimer, 0);
+
+    // Monitor timer: fires every MONITOR_INTERVAL ms to print status
+    monitorReportTimer = xTimerCreate("MonitorTimer", pdMS_TO_TICKS(MONITOR_INTERVAL), pdTRUE, (void *)3, referenceTimerCallback);
+    xTimerStart(monitorReportTimer, 0);
+
+    // After this, FreeRTOS takes over. Execution order:
+    // 1. DDS runs first (priority 3), blocks on empty queue
+    // 2. Generator runs (priority 2), self-triggers, releases first tasks at t=0
+    // 3. DDS wakes (messages in queue), inserts tasks, promotes earliest deadline
+    vTaskStartScheduler();
+
+    while (1)
+        ; // never reached unless scheduler fails (e.g., not enough heap)
+    return 0;
+}
 
 //==================================================================
 // DDS TASK - the brain of the scheduler (HIGHEST PRIORITY = 3)
